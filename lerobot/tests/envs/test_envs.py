@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import pickle
+import sys
 from dataclasses import dataclass, field
 
 import gymnasium as gym
@@ -22,10 +24,10 @@ import pytest
 import torch
 from gymnasium.envs.registration import register, registry as gym_registry
 from gymnasium.utils.env_checker import check_env
+from gymnasium.vector.utils import CloudpickleWrapper
 
-import lerobot
 from lerobot.configs.types import PolicyFeature
-from lerobot.envs.configs import EnvConfig
+from lerobot.envs.configs import EnvConfig, So101SimEnv
 from lerobot.envs.factory import make_env, make_env_config
 from lerobot.envs.utils import (
     _normalize_hub_result,
@@ -36,9 +38,16 @@ from tests.utils import require_env
 
 OBS_TYPES = ["state", "pixels", "pixels_agent_pos"]
 
+ENV_TASK_PAIRS = [
+    ("aloha", "AlohaInsertion-v0"),
+    ("aloha", "AlohaTransferCube-v0"),
+    ("pusht", "PushT-v0"),
+]
+AVAILABLE_ENVS = ["aloha", "pusht"]
+
 
 @pytest.mark.parametrize("obs_type", OBS_TYPES)
-@pytest.mark.parametrize("env_name, env_task", lerobot.env_task_pairs)
+@pytest.mark.parametrize("env_name, env_task", ENV_TASK_PAIRS)
 @require_env
 def test_env(env_name, env_task, obs_type):
     if env_name == "aloha" and obs_type == "state":
@@ -51,7 +60,7 @@ def test_env(env_name, env_task, obs_type):
     env.close()
 
 
-@pytest.mark.parametrize("env_name", lerobot.available_envs)
+@pytest.mark.parametrize("env_name", AVAILABLE_ENVS)
 @require_env
 def test_factory(env_name):
     cfg = make_env_config(env_name)
@@ -113,6 +122,63 @@ def test_factory_custom_gym_id():
     finally:
         if gym_id in gym_registry:
             del gym_registry[gym_id]
+
+
+def test_env_fn_registers_package_in_fresh_process(tmp_path, monkeypatch):
+    """An env registered by importing its package must be constructible in a process that never imported it.
+
+    AsyncVectorEnv workers are started with the "forkserver" context, so they do not inherit the
+    registry the parent filled in by importing `package_name`. This simulates such a worker: the
+    env factory is shipped the way AsyncVectorEnv ships it (CloudpickleWrapper, pickled while the
+    parent's registry still holds the id), then the id is dropped from the registry and the package
+    from `sys.modules` before the factory runs, exactly the state a forkserver child sees.
+    """
+    pkg = "lerobot_test_import_registered_env"
+    env_id = "LeRobotTestImportRegistered-v0"
+    if env_id in gym_registry:
+        pytest.skip(f"Environment ID {env_id} is already registered")
+
+    package_dir = tmp_path / pkg
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text(
+        "import gymnasium as gym\n"
+        f"gym.register(id={env_id!r}, entry_point='gymnasium.envs.classic_control:CartPoleEnv')\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    @EnvConfig.register_subclass("dummy_import_registered")
+    @dataclass
+    class ImportRegisteredEnv(EnvConfig):
+        task: str = env_id
+        features: dict[str, PolicyFeature] = field(default_factory=dict)
+
+        @property
+        def package_name(self) -> str:
+            return pkg
+
+        @property
+        def gym_id(self) -> str:
+            return env_id
+
+        @property
+        def gym_kwargs(self) -> dict:
+            return {}
+
+    try:
+        vec = ImportRegisteredEnv().create_envs(n_envs=1)["dummy_import_registered"][0]
+        vec.close()
+        # Globals the factory closes over travel by value, as copies taken in the parent.
+        shipped = pickle.dumps(CloudpickleWrapper(vec.env_fns[0]))
+
+        del gym_registry[env_id]
+        monkeypatch.delitem(sys.modules, pkg)
+
+        env = pickle.loads(shipped)()
+        assert env.spec.id == env_id
+        env.close()
+    finally:
+        if env_id in gym_registry:
+            del gym_registry[env_id]
 
 
 # Hub environment loading tests
@@ -266,3 +332,84 @@ def test_make_env_from_hub_async():
 
     # clean up
     env.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# so101_sim 评测口的默认值契约（我们自有的 EnvConfig 子类，不涉上游代码）
+#
+# 这几项配错都不报错、只表现为一个会被误读成「策略没学会」的低成功率，所以默认值必须
+# 与「已交付的 SO-101 数据集是怎么产生的」一致，且要有测试钉住 —— 曾经默认是 20 fps /
+# 128×128 / control_mode=None / 无口径换算，四项全与数据不符。
+#
+# 直接构造 So101SimEnv 而不经过 make_env_config：后者是**上游代码**，不动它。
+# 本组只读配置、不建仿真，因此在没有 GPU 的机器上也能跑。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_so101_sim_defaults_match_real_robot():
+    """默认值对齐真机口径：臂关节度 + 夹爪百分比、绝对关节角、标定分辨率、装得下最长轨迹。"""
+    cfg = So101SimEnv()
+
+    assert cfg.unit_convention == "real", "默认必须是真机口径（臂关节度、夹爪行程百分比）"
+    assert cfg.control_mode == "pd_joint_pos", "数据集录的是绝对关节角"
+    assert (cfg.observation_width, cfg.observation_height) == (640, 480), (
+        "相机的竖直视野角是在 640×480 下标定的，改宽高比会改水平视野"
+    )
+    assert cfg.fps == 30, "仿真 control_freq 与数据帧率都是 30"
+    assert cfg.episode_length >= 444, "已交付数据最长 444 帧，短了会静默截断"
+
+
+def test_so101_sim_gym_kwargs_carries_unit_convention():
+    """口径必须下发给仿真侧 —— 不在 gym_kwargs 里就等于这个参数不存在。"""
+    cfg = So101SimEnv(unit_convention="maniskill")
+
+    assert cfg.gym_kwargs["unit_convention"] == "maniskill"
+    for key in ("control_mode", "observation_width", "observation_height", "episode_length"):
+        assert key in cfg.gym_kwargs, f"{key} 没有下发给仿真侧"
+
+
+def test_so101_sim_rejects_unknown_unit_convention():
+    """非法口径要当场报错，而不是留到评测出一个低成功率再让人反推。"""
+    with pytest.raises(ValueError, match="unit_convention"):
+        So101SimEnv(unit_convention="deg")
+
+
+def test_so101_sim_visual_feature_shape_follows_resolution():
+    """观测空间的形状要跟着分辨率走 —— 声明与实际分岔时没有任何一步会报错。"""
+    cfg = So101SimEnv(observation_width=320, observation_height=240)
+
+    for camera in ("top", "wrist"):
+        assert cfg.features[f"pixels/{camera}"].shape == (240, 320, 3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 追加注册的契约：新类型能造出来，且上游已有行为**逐字未变**
+#
+# 规则是「加注册可以，改行为不行」。所以这里既要证明 so101_sim 能造，
+# 也要证明上游那三个分支与 else 的报文没被动过 —— 后者是本组测试真正的价值：
+# 一旦有人把 if/elif 改写成注册表查表，报文与可接受的类型集就都变了，
+# 而那种改写在功能上「看起来更好」，正是最容易被放行的一类越界。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_make_env_config_builds_so101_sim():
+    """我们追加的注册能造出对应配置。"""
+    cfg = make_env_config("so101_sim")
+
+    assert cfg.type == "so101_sim"
+    assert isinstance(cfg, So101SimEnv)
+
+
+@pytest.mark.parametrize("env_type", ["aloha", "pusht", "libero"])
+def test_make_env_config_upstream_branches_unchanged(env_type):
+    """上游原有的三个分支照旧可用。"""
+    assert make_env_config(env_type).type == env_type
+
+
+def test_make_env_config_unknown_type_keeps_upstream_message():
+    """未注册类型的报文必须与上游逐字相同 —— 改报文也是改行为。
+
+    0.6 线对齐的是上游 0.6.1 的报文（make_env_config 已改走注册表）。
+    """
+    with pytest.raises(ValueError, match=r"^Environment type 'nope' is not registered\. Available: "):
+        make_env_config("nope")

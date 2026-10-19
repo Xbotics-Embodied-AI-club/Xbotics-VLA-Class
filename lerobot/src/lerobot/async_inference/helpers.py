@@ -20,10 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
 
-from lerobot.configs.types import PolicyFeature
-from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.configs import PolicyFeature
 
 # NOTE: Configs need to be loaded for the client to be able to instantiate the policy config
 from lerobot.policies import (  # noqa: F401
@@ -36,6 +37,7 @@ from lerobot.policies import (  # noqa: F401
 )
 from lerobot.robots.robot import Robot
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.utils.utils import init_logging
 
 Action = torch.Tensor
@@ -89,10 +91,13 @@ def raw_observation_to_observation(
     raw_observation: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    rename_map: dict[str, str] | None = None,
 ) -> Observation:
     observation = {}
 
-    observation = prepare_raw_observation(raw_observation, lerobot_features, policy_image_features)
+    observation = prepare_raw_observation(
+        raw_observation, lerobot_features, policy_image_features, rename_map=rename_map
+    )
     for k, v in observation.items():
         if isinstance(v, torch.Tensor):  # VLAs present natural-language instructions in observations
             if "image" in k:
@@ -105,8 +110,9 @@ def raw_observation_to_observation(
 
 
 def prepare_image(image: torch.Tensor) -> torch.Tensor:
-    """Minimal preprocessing to turn int8 images to float32 in [0, 1], and create a memory-contiguous tensor"""
-    image = image.type(torch.float32) / 255
+    """Minimal preprocessing to turn RGB uint8 images to float32 in [0, 1], and create a memory-contiguous tensor"""
+    if image.dtype == torch.uint8:
+        image = image.type(torch.float32) / 255
     image = image.contiguous()
 
     return image
@@ -144,9 +150,16 @@ def prepare_raw_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    rename_map: dict[str, str] | None = None,
 ) -> Observation:
     """Matches keys from the raw robot_obs dict to the keys expected by a given policy (passed as
-    policy_image_features)."""
+    policy_image_features).
+
+    Xbotics: ``rename_map`` is the camera rename the server's preprocessor applies (a policy trained
+    with ``--rename_map`` knows its cameras by the renamed keys). Images keep their robot keys, since
+    the preprocessor renames them, but are resized to the shape of the policy camera they will become.
+    """
+    rename_map = rename_map or {}
     # 1. {motor.pos1:value1, motor.pos2:value2, ..., laptop:np.ndarray} ->
     # -> {observation.state:[value1,value2,...], observation.images.laptop:np.ndarray}
     lerobot_obs = make_lerobot_observation(robot_obs, lerobot_features)
@@ -162,7 +175,9 @@ def prepare_raw_observation(
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(
+            torch.tensor(lerobot_obs[key]), policy_image_features[rename_map.get(key, key)].shape
+        )
         for key in image_keys
     }
 
@@ -232,6 +247,56 @@ class TimedObservation(TimedData):
 
     def get_observation(self):
         return self.observation
+
+
+@dataclass
+class JpegImage:
+    """robot_client 压好的一张相机画面（JPEG 字节）；policy_server 收到后解回数组再进前处理。
+
+    两路 640×480 原图 pickle 后每次约 1.8 MB：百兆网口一秒只发得出一两次，云服务器 5 Mbps 上行
+    更是发不动；压成 JPEG 后每张几十 KB。训练用的数据集本来就存成有损视频，JPEG 的损失与之同级。
+    """
+
+    data: bytes
+
+
+def _is_camera_frame(value: Any) -> bool:
+    return (
+        isinstance(value, np.ndarray) and value.dtype == np.uint8 and value.ndim == 3 and value.shape[2] == 3
+    )
+
+
+def encode_observation_images(observation: RawObservation, quality: int) -> RawObservation:
+    """把观测里的相机画面（H×W×3 uint8）压成 JpegImage，其余键原样带过；不改入参。
+
+    通道顺序原样往返：编码前按 RGB→BGR 转给 OpenCV，解码后再转回来，进来是什么顺序出去还是什么顺序。
+    """
+    encoded = {}
+    for key, value in observation.items():
+        if _is_camera_frame(value):
+            ok, buffer = cv2.imencode(
+                ".jpg", cv2.cvtColor(value, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, quality]
+            )
+            if not ok:
+                raise RuntimeError(f"JPEG 编码失败：{key} {value.shape}")
+            encoded[key] = JpegImage(buffer.tobytes())
+        else:
+            encoded[key] = value
+    return encoded
+
+
+def decode_observation_images(observation: RawObservation) -> RawObservation:
+    """把 JpegImage 解回 H×W×3 uint8 数组；原图（不压的客户端发来的）原样放行。"""
+    return {
+        key: (
+            cv2.cvtColor(
+                cv2.imdecode(np.frombuffer(value.data, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB
+            )
+            if isinstance(value, JpegImage)
+            else value
+        )
+        for key, value in observation.items()
+    }
 
 
 @dataclass

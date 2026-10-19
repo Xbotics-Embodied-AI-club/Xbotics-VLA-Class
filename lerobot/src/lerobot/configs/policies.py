@@ -16,22 +16,24 @@ import builtins
 import json
 import os
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
 from typing import Any, TypeVar
 
 import draccus
+import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.optim.optimizers import OptimizerConfig
-from lerobot.optim.schedulers import LRSchedulerConfig
+from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
-from lerobot.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
+
+from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
@@ -79,6 +81,31 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
     pretrained_path: Path | None = None
+    # Optional Hub revision (commit hash, branch, or tag) to pin the pretrained model version.
+    pretrained_revision: str | None = None
+
+    # Register draccus encode/decode functions for the torch.dtype values held by dtype fields.
+    # Xbotics: copied from upstream main (without its base-class ``dtype`` field) so policies that
+    # declare their own dtype field (lingbot_vla_v2) can save and reload their config.
+    @staticmethod
+    @draccus.decode.register(torch.dtype)
+    def _decode_dtype(value: Any, path: Sequence[str] = ()) -> torch.dtype:
+        """Resolve a dtype name coming from config.json or the command line.
+
+        Args:
+            value: The raw serialized value, e.g. "bfloat16".
+            path: The field breadcrumb draccus prefixes onto error messages, e.g. ("policy", "dtype").
+        """
+        dtype = getattr(torch, str(value).removeprefix("torch."), None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Invalid dtype {value!r}: expected a torch dtype name.")
+        return dtype
+
+    @staticmethod
+    @draccus.encode.register(torch.dtype)
+    def _encode_dtype(value: torch.dtype, declared_type: type | None = None) -> str:
+        """Serialize a dtype to its bare name, e.g. torch.bfloat16 -> "bfloat16"."""
+        return str(value).removeprefix("torch.")
 
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):
@@ -161,8 +188,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # Encode against the base class so draccus includes the choice "type" key,
+        # which `from_pretrained` needs to resolve the concrete subclass.
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(draccus.encode(self, PreTrainedConfig), f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -203,24 +232,30 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
 
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
-
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
         with open(config_file) as f:
             config = json.load(f)
 
-        config.pop("type")
+        # Resolve the concrete config subclass from the serialized "type" tag, then parse
+        # the config (with CLI overrides) directly for that class. The "type" key is
+        # stripped because draccus only consumes it when parsing the registry base class.
+        policy_type = config.pop("type", None)
+        if policy_type is None:
+            raise ValueError(f"Missing 'type' field in {CONFIG_NAME} of {model_id}")
+        try:
+            config_cls = cls.get_choice_class(policy_type)
+        except Exception as e:
+            raise ValueError(
+                f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
+                f"Available policy types: {cls.get_known_choices()}"
+            ) from e
+
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(config_cls, config_file, args=cli_overrides)

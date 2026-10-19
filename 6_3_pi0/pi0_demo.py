@@ -9,11 +9,16 @@ import torch
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
-from lerobot.envs.utils import add_envs_task, preprocess_observation
+from lerobot.envs.utils import preprocess_observation
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.utils.io_utils import write_video
 import lerobot.policies  # noqa: F401
 import libero.libero as libero_benchmark
+
+# LeRobot 0.6 删掉了 lerobot.envs.utils.add_envs_task，这里照原样补一个：把环境的任务描述放进观测
+def add_envs_task(env, observation):
+    observation["task"] = list(env.call("task_description"))
+    return observation
 
 # MuJoCo 的离屏渲染需要 EGL。
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -107,6 +112,8 @@ def main() -> None:
             # LIBERO 的 success 信号放在 final_info 里。
             if "final_info" in info and isinstance(info["final_info"], dict):
                 success = bool(info["final_info"]["is_success"][0])
+            elif "is_success" in info:  # LeRobot 0.6 直接放在 info 里
+                success = bool(info["is_success"][0])
 
             if bool(terminated[0]) or bool(truncated[0]):
                 break

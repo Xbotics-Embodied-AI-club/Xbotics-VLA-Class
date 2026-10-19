@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.lerobot_types import EnvTransition, RobotObservation, TransitionKey
 from lerobot.utils.constants import (
     ACTION_TOKEN_MASK,
     ACTION_TOKENS,
@@ -40,7 +42,6 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _transformers_available
 
-from .core import EnvTransition, RobotObservation, TransitionKey
 from .pipeline import ActionProcessorStep, ObservationProcessorStep, ProcessorStepRegistry
 
 # Conditional import for type checking and lazy loading
@@ -136,8 +137,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         # Standardize to a list of strings for the tokenizer
         if isinstance(task, str):
             return [task]
-        elif isinstance(task, list) and all(isinstance(t, str) for t in task):
-            return task
+        elif isinstance(task, (list, tuple)) and all(isinstance(t, str) for t in task):
+            return list(task)
 
         return None
 
@@ -292,6 +293,18 @@ class TokenizerProcessorStep(ObservationProcessorStep):
             config["tokenizer_name"] = self.tokenizer_name
 
         return config
+
+    def save_artifacts(self, save_directory: Path) -> dict[str, str]:
+        """Save the tokenizer so object-provided instances reload without overrides.
+
+        Xbotics: processor artifacts copied from upstream main (#4182).
+        """
+        artifact_path = Path("tokenizer")
+        save_pretrained = getattr(self.input_tokenizer, "save_pretrained", None)
+        if save_pretrained is None:
+            raise TypeError("Tokenizer must implement save_pretrained() to save a portable pipeline.")
+        save_pretrained(save_directory / artifact_path)
+        return {"tokenizer_name": artifact_path.as_posix()}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

@@ -37,8 +37,10 @@ WANDB_PROJECT = "act-libero"
 EPOCHS_PER_EVAL = 2
 
 
-def get_steps_per_epoch(num_episodes: int) -> int:
-    return max(1, (num_episodes + BATCH_SIZE - 1) // BATCH_SIZE)
+def get_steps_per_epoch(num_frames: int) -> int:
+    # 一个 epoch = 把这些轨迹的每一帧过一遍。原来按轨迹条数算，一个 epoch 只有 1 步，
+    # 于是每 2 步就评测并存一次检查点，几十分钟就能写满十几 GB
+    return max(1, (num_frames + BATCH_SIZE - 1) // BATCH_SIZE)
 
 
 def get_task_episodes(metadata: LeRobotDatasetMetadata, task_name: str) -> list[int]:
@@ -53,7 +55,8 @@ def get_task_episodes(metadata: LeRobotDatasetMetadata, task_name: str) -> list[
         return selected
 
     target_task_index = int(metadata.tasks.loc[task_name, "task_index"])
-    metadata.pull_from_repo(allow_patterns="data/")
+    # LeRobot 0.6 把 pull_from_repo 改名为 _pull_from_repo，参数不变
+    metadata._pull_from_repo(allow_patterns="data/")
 
     selected = []
     for parquet_path in sorted((metadata.root / "data").glob("chunk-*/*.parquet")):
@@ -74,9 +77,13 @@ def main() -> None:
     print(f"[数据] 目标 task: {TARGET_TASK}")
     print(f"[数据] 筛选到 {len(episodes)} 条轨迹, episode_ids: {episodes[:5]}...")
 
-    steps_per_epoch = get_steps_per_epoch(len(episodes))
+    lengths = dict(zip(metadata.episodes["episode_index"], metadata.episodes["length"]))
+    num_frames = sum(lengths[e] for e in episodes)
+    print(f"[数据] 共 {num_frames} 帧")
+    steps_per_epoch = get_steps_per_epoch(num_frames)
     eval_freq = steps_per_epoch * EPOCHS_PER_EVAL
-    save_freq = eval_freq
+    # 每 1 万步存一次检查点（训练结束时 LeRobot 也会存）。一个检查点约 600 MB，跟着评测一起存会存上千个
+    save_freq = 10000
 
     policy_cfg = ACTConfig(
         device="cuda",
@@ -106,7 +113,7 @@ def main() -> None:
         batch_size=BATCH_SIZE,
         num_workers=2,
         steps=TRAIN_STEPS,
-        eval_freq=eval_freq,
+        env_eval_freq=eval_freq,  # LeRobot 0.6 把 eval_freq 改名为 env_eval_freq
         save_freq=save_freq,
         log_freq=LOG_FREQ,
         save_checkpoint=True,
@@ -123,7 +130,7 @@ def main() -> None:
     print(f"\n[训练] 总步数: {TRAIN_STEPS}")
     print(f"[训练] batch_size: {BATCH_SIZE}")
     print(f"[训练] steps_per_epoch: {steps_per_epoch}")
-    print(f"[训练] 每 {EPOCHS_PER_EVAL} 个 epoch 评估/保存一次")
+    print(f"[训练] 每 {EPOCHS_PER_EVAL} 个 epoch 评估一次")
     print(f"[训练] eval_freq: {eval_freq}")
     print(f"[训练] save_freq: {save_freq}")
     print(f"[训练] log_freq: {LOG_FREQ}")
